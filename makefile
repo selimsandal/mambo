@@ -31,7 +31,10 @@ CFLAGS+=-D_GNU_SOURCE -g -std=gnu99 -O2 -Wunused-variable
 CFLAGS+=-DVERSION=\"$(VERSION)\"
 
 LDFLAGS+=-static -ldl
-LIBS=-lelf -lpthread -lz
+LIBS=$(shell pkg-config --libs --static libelf 2>/dev/null)
+ifeq ($(strip $(LIBS)),)
+	LIBS=-lelf -lpthread -lz -lzstd
+endif
 HEADERS=*.h makefile
 INCLUDES=-I/usr/include/libelf -I.
 SOURCES= common.c dbm.c traces.c syscalls.c dispatcher.c util.S traces_common.c
