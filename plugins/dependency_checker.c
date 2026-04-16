@@ -56,13 +56,20 @@ struct chain_entry {
   chain_entry_t *next;
 };
 
+typedef struct local_chain_counter local_chain_counter_t;
+struct local_chain_counter {
+  chain_entry_t *chain;
+  uint64_t count;
+  local_chain_counter_t *next;
+};
+
 typedef struct {
   uint64_t total_instr;
   uint64_t total_long;
   uint64_t total_expensive;
   inst_info_t window[WINDOW_SIZE];
   int window_count;
-  mambo_ht_t *chain_map;
+  mambo_ht_t *chain_map; // hash -> local_chain_counter_t* collision list
 } thread_data_t;
 
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -452,19 +459,12 @@ static bool detect_lej(const inst_info_t *window, int window_count,
   return true;
 }
 
-static chain_entry_t *lookup_or_create_chain(mambo_context *ctx,
-                                             thread_data_t *t_data,
-                                             const inst_info_t *long_inst,
-                                             const inst_info_t *expensive_inst,
-                                             const inst_info_t *join_inst,
-                                             int rd_l, int rd_e) {
-  uintptr_t key = hash_chain_key(long_inst->pc, expensive_inst->pc, join_inst->pc);
-  chain_entry_t *entry = NULL;
-
-  if (mambo_ht_get(t_data->chain_map, key, (uintptr_t *)&entry) == 0 &&
-      chain_matches(entry, long_inst->pc, expensive_inst->pc, join_inst->pc)) {
-    return entry;
-  }
+static chain_entry_t *lookup_or_create_global_chain(mambo_context *ctx,
+                                                    const inst_info_t *long_inst,
+                                                    const inst_info_t *expensive_inst,
+                                                    const inst_info_t *join_inst,
+                                                    int rd_l, int rd_e) {
+  chain_entry_t *entry;
 
   pthread_mutex_lock(&g_mutex);
 
@@ -498,8 +498,35 @@ static chain_entry_t *lookup_or_create_chain(mambo_context *ctx,
 
   pthread_mutex_unlock(&g_mutex);
 
-  assert(mambo_ht_add(t_data->chain_map, key, (uintptr_t)entry) == 0);
   return entry;
+}
+
+static local_chain_counter_t *lookup_or_create_local_chain_counter(
+    mambo_context *ctx, thread_data_t *t_data, const inst_info_t *long_inst,
+    const inst_info_t *expensive_inst, const inst_info_t *join_inst,
+    int rd_l, int rd_e) {
+  uintptr_t key = hash_chain_key(long_inst->pc, expensive_inst->pc, join_inst->pc);
+  local_chain_counter_t *head = NULL;
+
+  if (mambo_ht_get(t_data->chain_map, key, (uintptr_t *)&head) == 0) {
+    for (local_chain_counter_t *entry = head; entry != NULL; entry = entry->next) {
+      if (chain_matches(entry->chain, long_inst->pc, expensive_inst->pc, join_inst->pc)) {
+        return entry;
+      }
+    }
+  }
+
+  local_chain_counter_t *local_counter =
+      (local_chain_counter_t *)mambo_alloc(ctx, sizeof(local_chain_counter_t));
+  assert(local_counter != NULL);
+  memset(local_counter, 0, sizeof(local_chain_counter_t));
+
+  local_counter->chain = lookup_or_create_global_chain(
+      ctx, long_inst, expensive_inst, join_inst, rd_l, rd_e);
+  local_counter->next = head;
+
+  assert(mambo_ht_add(t_data->chain_map, key, (uintptr_t)local_counter) == 0);
+  return local_counter;
 }
 
 static void write_stats(uint64_t total_occurrences, int unique_count,
@@ -633,6 +660,18 @@ int dependency_checker_post_thread(mambo_context *ctx) {
           t_data->total_long, t_data->total_expensive);
 
   if (t_data->chain_map != NULL) {
+    for (size_t index = 0; index < t_data->chain_map->size; index++) {
+      if (t_data->chain_map->entries[index].key == 0) {
+        continue;
+      }
+
+      local_chain_counter_t *entry =
+          (local_chain_counter_t *)t_data->chain_map->entries[index].value;
+      for (; entry != NULL; entry = entry->next) {
+        atomic_increment_u64(&entry->chain->count, entry->count);
+      }
+    }
+
     free(t_data->chain_map->entries);
     pthread_mutex_destroy(&t_data->chain_map->lock);
     mambo_free(ctx, t_data->chain_map);
@@ -682,7 +721,7 @@ int dependency_checker_pre_inst(mambo_context *ctx) {
            expensive_idx++) {
         int rd_l = -1;
         int rd_e = -1;
-        chain_entry_t *entry;
+        local_chain_counter_t *entry;
 
         if (expensive_idx == long_idx ||
             t_data->window[expensive_idx].iclass != INST_EXPENSIVE) {
@@ -694,9 +733,9 @@ int dependency_checker_pre_inst(mambo_context *ctx) {
           continue;
         }
 
-        entry = lookup_or_create_chain(ctx, t_data, &t_data->window[long_idx],
-                                       &t_data->window[expensive_idx],
-                                       &curr_inst, rd_l, rd_e);
+        entry = lookup_or_create_local_chain_counter(
+            ctx, t_data, &t_data->window[long_idx],
+            &t_data->window[expensive_idx], &curr_inst, rd_l, rd_e);
         emit_counter64_incr(ctx, &entry->count, 1);
         found = true;
       }

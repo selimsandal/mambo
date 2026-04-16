@@ -234,7 +234,7 @@ size_t scan_trace(dbm_thread *thread_data, uint16_t *address, cc_type type, int 
     return 0;
   }
 
-  __clear_cache(thread_data->code_cache_meta[trace_id].tpc, write_p + 4);
+  __clear_cache((void *)thread_data->code_cache_meta[trace_id].tpc, write_p + 4);
 
   thread_data->trace_fragment_count++;
 
@@ -379,7 +379,7 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
     case jalr_riscv: {
       *next_addr = lookup_or_scan(thread_data, target);
 #ifdef DBM_TRIBI
-      if (*next_addr >= thread_data->code_cache->traces) {
+      if (*next_addr >= (uintptr_t)thread_data->code_cache->traces) {
         insert_tribi_prediction(thread_data, source_index, target);
       }
 #endif
@@ -427,7 +427,7 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
   debug("len: %d\n\n", fragment_len);
 
   if (fragment_len == 0) {
-    thread_data->active_trace.write_p = start_addr;
+    thread_data->active_trace.write_p = (uint8_t *)start_addr;
     addr = active_trace_lookup(thread_data, target);
     if (addr == UINT_MAX) {
       addr = active_trace_lookup_or_scan(thread_data, target);
@@ -457,4 +457,3 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
 }
 #endif
 #endif
-

@@ -628,7 +628,8 @@ int emit_branch(mambo_context *ctx, void *target) {
 
 #ifdef __riscv
 int emit_riscv_cond_branch(mambo_context *ctx, void *target, int rs1, int rs2, int branch_condition) {
-  return riscv_branch_helper((uint16_t **)&ctx->code.write_p, target, rs1, rs2, branch_condition);
+  return riscv_branch_helper((uint16_t **)&ctx->code.write_p, (uintptr_t)target,
+                             rs1, rs2, branch_condition);
 }
 #endif
 
