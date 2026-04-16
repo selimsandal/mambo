@@ -5,6 +5,7 @@
 #PLUGINS+=plugins/cachesim/cachesim.c plugins/cachesim/cachesim.S plugins/cachesim/cachesim_model.c
 #PLUGINS+=plugins/poc_log_returns.c
 #PLUGINS+=plugins/instruction_mix.c
+#PLUGINS+=plugins/dependency_checker.c
 #PLUGINS+=plugins/strace.c
 #PLUGINS+=plugins/symbol_example.c
 #PLUGINS+=plugins/memcheck/memcheck.S plugins/memcheck/memcheck.c plugins/memcheck/naive_stdlib.c
@@ -100,6 +101,9 @@ cachesim:
 
 memcheck:
 	PLUGINS="plugins/memcheck/memcheck.S plugins/memcheck/memcheck.c plugins/memcheck/naive_stdlib.c" OUTPUT_FILE=mambo_memcheck make
+
+dependency_checker:
+	PLUGINS="plugins/dependency_checker.c" OUTPUT_FILE=mambo_dependency_checker make
 
 clean:
 	rm -f dbm elf/elf_loader.o elf/symbol_parser.o

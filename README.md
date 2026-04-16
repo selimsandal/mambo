@@ -77,8 +77,13 @@ Plugin API
 The plugin API is event-driven. Plugins should use an initialisation function with `__attribute__((constructor))` to register themselves using `mambo_register_plugin()`. Once a plugin is registered, it can install callbacks for various events using the `mambo_register_*_cb()` functions. Callback-related functions are listed in [`api/plugin_support.h`](api/plugin_support.h). Code generation helpers are listed in [`api/helpers.h`](api/helpers.h) and code generation functions are listed in `api/emit_<INST SET>.h` headers, which are generated at build-time).
 
 Sample plugins are available in the [`plugins/`](plugins) directory.
+The RISC-V-only [`plugins/dependency_checker.c`](plugins/dependency_checker.c)
+plugin detects LEJ chains (load -> expensive -> join) and writes `stats.txt`
+and `chains.txt` when the instrumented application exits.
 
 To build MAMBO with plugin support, the source code or object file(s) of the plugin you're trying to build must be added to the `PLUGINS=` line in the `makefile`, or provided as an argument/envvar. Note that multiple plugins can be enabled at the same time (and will work correctly if properly designed). For performance reasons, it is recommended to remove unused plugins from the `PLUGINS=` list. Additional arguments that are required to build the plugins can be provided through `PLUGIN_ARGS`.
+The dependency checker can also be built directly with `make dependency_checker`,
+which produces a `mambo_dependency_checker` binary.
 
 
 Known issues
