@@ -26,6 +26,7 @@
 #define WINDOW_SIZE 16
 #define MAX_GAP 4
 #define CHAIN_MAP_INIT 1024
+#define HOTSPOT_TOP_LIMIT 20
 
 typedef enum {
   INST_OTHER = 0,
@@ -62,6 +63,35 @@ struct local_chain_counter {
   uint64_t count;
   local_chain_counter_t *next;
 };
+
+typedef enum {
+  HOTSPOT_ROLE_TOTAL = 0,
+  HOTSPOT_ROLE_LONG = 1,
+  HOTSPOT_ROLE_EXPENSIVE = 2,
+  HOTSPOT_ROLE_JOIN = 3,
+} hotspot_role_t;
+
+typedef struct {
+  uintptr_t pc;
+  uint64_t total_count;
+  uint64_t long_count;
+  uint64_t expensive_count;
+  uint64_t join_count;
+  const char *text;
+} hotspot_entry_t;
+
+typedef struct {
+  chain_entry_t **chains;
+  size_t chain_count;
+  uint64_t total_occurrences;
+  chain_entry_t *most_common_chain;
+  hotspot_entry_t *hotspots;
+  size_t hotspot_count;
+  hotspot_entry_t **hotspots_by_total;
+  hotspot_entry_t **hotspots_by_long;
+  hotspot_entry_t **hotspots_by_expensive;
+  hotspot_entry_t **hotspots_by_join;
+} analysis_data_t;
 
 typedef struct {
   uint64_t total_instr;
@@ -144,6 +174,305 @@ static chain_entry_t *find_global_chain(uintptr_t long_addr,
   }
 
   return NULL;
+}
+
+static int compare_chain_rank_desc(const void *lhs, const void *rhs) {
+  const chain_entry_t *const *left = (const chain_entry_t *const *)lhs;
+  const chain_entry_t *const *right = (const chain_entry_t *const *)rhs;
+
+  if ((*left)->count < (*right)->count) {
+    return 1;
+  }
+  if ((*left)->count > (*right)->count) {
+    return -1;
+  }
+  if ((*left)->chain_id > (*right)->chain_id) {
+    return 1;
+  }
+  if ((*left)->chain_id < (*right)->chain_id) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static uint64_t hotspot_role_count(const hotspot_entry_t *entry,
+                                   hotspot_role_t role) {
+  switch (role) {
+    case HOTSPOT_ROLE_TOTAL:
+      return entry->total_count;
+    case HOTSPOT_ROLE_LONG:
+      return entry->long_count;
+    case HOTSPOT_ROLE_EXPENSIVE:
+      return entry->expensive_count;
+    case HOTSPOT_ROLE_JOIN:
+      return entry->join_count;
+  }
+
+  return 0;
+}
+
+static int compare_hotspot_rank_desc(const hotspot_entry_t *left,
+                                     const hotspot_entry_t *right,
+                                     hotspot_role_t role) {
+  uint64_t left_role_count = hotspot_role_count(left, role);
+  uint64_t right_role_count = hotspot_role_count(right, role);
+
+  if (left_role_count < right_role_count) {
+    return 1;
+  }
+  if (left_role_count > right_role_count) {
+    return -1;
+  }
+  if (left->total_count < right->total_count) {
+    return 1;
+  }
+  if (left->total_count > right->total_count) {
+    return -1;
+  }
+  if (left->pc > right->pc) {
+    return 1;
+  }
+  if (left->pc < right->pc) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static int compare_hotspot_total_desc(const void *lhs, const void *rhs) {
+  const hotspot_entry_t *const *left = (const hotspot_entry_t *const *)lhs;
+  const hotspot_entry_t *const *right = (const hotspot_entry_t *const *)rhs;
+
+  return compare_hotspot_rank_desc(*left, *right, HOTSPOT_ROLE_TOTAL);
+}
+
+static int compare_hotspot_long_desc(const void *lhs, const void *rhs) {
+  const hotspot_entry_t *const *left = (const hotspot_entry_t *const *)lhs;
+  const hotspot_entry_t *const *right = (const hotspot_entry_t *const *)rhs;
+
+  return compare_hotspot_rank_desc(*left, *right, HOTSPOT_ROLE_LONG);
+}
+
+static int compare_hotspot_expensive_desc(const void *lhs, const void *rhs) {
+  const hotspot_entry_t *const *left = (const hotspot_entry_t *const *)lhs;
+  const hotspot_entry_t *const *right = (const hotspot_entry_t *const *)rhs;
+
+  return compare_hotspot_rank_desc(*left, *right, HOTSPOT_ROLE_EXPENSIVE);
+}
+
+static int compare_hotspot_join_desc(const void *lhs, const void *rhs) {
+  const hotspot_entry_t *const *left = (const hotspot_entry_t *const *)lhs;
+  const hotspot_entry_t *const *right = (const hotspot_entry_t *const *)rhs;
+
+  return compare_hotspot_rank_desc(*left, *right, HOTSPOT_ROLE_JOIN);
+}
+
+static hotspot_entry_t *lookup_or_create_hotspot(mambo_ht_t *hotspot_map,
+                                                 hotspot_entry_t *hotspots,
+                                                 size_t *hotspot_count,
+                                                 uintptr_t pc,
+                                                 const char *text) {
+  uintptr_t index_plus_one = 0;
+
+  assert(pc != 0);
+
+  if (mambo_ht_get(hotspot_map, pc, &index_plus_one) == 0) {
+    return &hotspots[index_plus_one - 1];
+  }
+
+  hotspot_entry_t *entry = &hotspots[*hotspot_count];
+
+  memset(entry, 0, sizeof(*entry));
+  entry->pc = pc;
+  entry->text = text;
+
+  (*hotspot_count)++;
+  assert(mambo_ht_add(hotspot_map, pc, (uintptr_t)(*hotspot_count)) == 0);
+
+  return entry;
+}
+
+static void add_hotspot_count(mambo_ht_t *hotspot_map, hotspot_entry_t *hotspots,
+                              size_t *hotspot_count, uintptr_t pc,
+                              const char *text, hotspot_role_t role,
+                              uint64_t count) {
+  hotspot_entry_t *entry =
+      lookup_or_create_hotspot(hotspot_map, hotspots, hotspot_count, pc, text);
+
+  entry->total_count += count;
+
+  switch (role) {
+    case HOTSPOT_ROLE_TOTAL:
+      break;
+    case HOTSPOT_ROLE_LONG:
+      entry->long_count += count;
+      break;
+    case HOTSPOT_ROLE_EXPENSIVE:
+      entry->expensive_count += count;
+      break;
+    case HOTSPOT_ROLE_JOIN:
+      entry->join_count += count;
+      break;
+  }
+}
+
+static void free_analysis_data(analysis_data_t *analysis) {
+  free(analysis->chains);
+  free(analysis->hotspots);
+  free(analysis->hotspots_by_total);
+  free(analysis->hotspots_by_long);
+  free(analysis->hotspots_by_expensive);
+  free(analysis->hotspots_by_join);
+
+  memset(analysis, 0, sizeof(*analysis));
+}
+
+static void prepare_analysis_data(analysis_data_t *analysis) {
+  mambo_ht_t hotspot_map;
+  size_t chain_index = 0;
+
+  memset(analysis, 0, sizeof(*analysis));
+
+  for (chain_entry_t *entry = g_chain_list; entry != NULL; entry = entry->next) {
+    analysis->chain_count++;
+    analysis->total_occurrences += entry->count;
+
+    if (analysis->most_common_chain == NULL ||
+        entry->count > analysis->most_common_chain->count) {
+      analysis->most_common_chain = entry;
+    }
+  }
+
+  if (analysis->chain_count == 0) {
+    return;
+  }
+
+  analysis->chains = calloc(analysis->chain_count, sizeof(*analysis->chains));
+  analysis->hotspots =
+      calloc(analysis->chain_count * 3, sizeof(*analysis->hotspots));
+  assert(analysis->chains != NULL);
+  assert(analysis->hotspots != NULL);
+  assert(mambo_ht_init(&hotspot_map, analysis->chain_count * 4, 0, 80, true) == 0);
+
+  for (chain_entry_t *entry = g_chain_list; entry != NULL; entry = entry->next) {
+    analysis->chains[chain_index++] = entry;
+
+    add_hotspot_count(&hotspot_map, analysis->hotspots, &analysis->hotspot_count,
+                      entry->long_addr, entry->long_text, HOTSPOT_ROLE_LONG,
+                      entry->count);
+    add_hotspot_count(&hotspot_map, analysis->hotspots, &analysis->hotspot_count,
+                      entry->expensive_addr, entry->expensive_text,
+                      HOTSPOT_ROLE_EXPENSIVE, entry->count);
+    add_hotspot_count(&hotspot_map, analysis->hotspots, &analysis->hotspot_count,
+                      entry->join_addr, entry->join_text, HOTSPOT_ROLE_JOIN,
+                      entry->count);
+  }
+
+  qsort(analysis->chains, analysis->chain_count, sizeof(*analysis->chains),
+        compare_chain_rank_desc);
+
+  analysis->hotspots_by_total =
+      calloc(analysis->hotspot_count, sizeof(*analysis->hotspots_by_total));
+  analysis->hotspots_by_long =
+      calloc(analysis->hotspot_count, sizeof(*analysis->hotspots_by_long));
+  analysis->hotspots_by_expensive =
+      calloc(analysis->hotspot_count, sizeof(*analysis->hotspots_by_expensive));
+  analysis->hotspots_by_join =
+      calloc(analysis->hotspot_count, sizeof(*analysis->hotspots_by_join));
+  assert(analysis->hotspots_by_total != NULL);
+  assert(analysis->hotspots_by_long != NULL);
+  assert(analysis->hotspots_by_expensive != NULL);
+  assert(analysis->hotspots_by_join != NULL);
+
+  for (size_t index = 0; index < analysis->hotspot_count; index++) {
+    analysis->hotspots_by_total[index] = &analysis->hotspots[index];
+    analysis->hotspots_by_long[index] = &analysis->hotspots[index];
+    analysis->hotspots_by_expensive[index] = &analysis->hotspots[index];
+    analysis->hotspots_by_join[index] = &analysis->hotspots[index];
+  }
+
+  qsort(analysis->hotspots_by_total, analysis->hotspot_count,
+        sizeof(*analysis->hotspots_by_total), compare_hotspot_total_desc);
+  qsort(analysis->hotspots_by_long, analysis->hotspot_count,
+        sizeof(*analysis->hotspots_by_long), compare_hotspot_long_desc);
+  qsort(analysis->hotspots_by_expensive, analysis->hotspot_count,
+        sizeof(*analysis->hotspots_by_expensive), compare_hotspot_expensive_desc);
+  qsort(analysis->hotspots_by_join, analysis->hotspot_count,
+        sizeof(*analysis->hotspots_by_join), compare_hotspot_join_desc);
+
+  free(hotspot_map.entries);
+  pthread_mutex_destroy(&hotspot_map.lock);
+}
+
+static void write_hotspot_summary(FILE *stats_file, const char *label,
+                                  hotspot_entry_t *const *ordered_hotspots,
+                                  size_t hotspot_count, hotspot_role_t role,
+                                  uint64_t total_occurrences) {
+  if (hotspot_count == 0 ||
+      hotspot_role_count(ordered_hotspots[0], role) == 0) {
+    fprintf(stats_file, "  %-26s: (none detected)\n", label);
+    return;
+  }
+
+  const hotspot_entry_t *entry = ordered_hotspots[0];
+  uint64_t count = hotspot_role_count(entry, role);
+
+  fprintf(stats_file, "  %-26s: 0x%" PRIxPTR " | %" PRIu64
+          " occurrences (%.4f%%) | %s\n",
+          label, entry->pc, count,
+          total_occurrences > 0
+              ? (100.0 * (double)count / (double)total_occurrences)
+              : 0.0,
+          entry->text != NULL ? entry->text : "(unknown)");
+}
+
+static void write_hotspot_section(FILE *hotspots_file, const char *title,
+                                  hotspot_entry_t *const *ordered_hotspots,
+                                  size_t hotspot_count, hotspot_role_t role,
+                                  uint64_t total_occurrences) {
+  size_t printed = 0;
+
+  fprintf(hotspots_file, "%s\n", title);
+
+  for (size_t index = 0;
+       index < hotspot_count && printed < HOTSPOT_TOP_LIMIT;
+       index++) {
+    const hotspot_entry_t *entry = ordered_hotspots[index];
+    uint64_t count = hotspot_role_count(entry, role);
+    char *sym_name = NULL;
+    char *filename = NULL;
+
+    if (count == 0) {
+      break;
+    }
+
+    get_symbol_info_by_addr(entry->pc, &sym_name, NULL, &filename);
+
+    fprintf(hotspots_file,
+            "  %2zu. %" PRIu64 " occurrences (%.4f%%) | roles L/E/J = "
+            "%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+            printed + 1, count,
+            total_occurrences > 0
+                ? (100.0 * (double)count / (double)total_occurrences)
+                : 0.0,
+            entry->long_count, entry->expensive_count, entry->join_count);
+    fprintf(hotspots_file, "      0x%016" PRIxPTR "  %-36s  [%s | %s]\n",
+            entry->pc,
+            entry->text != NULL ? entry->text : "(unknown)",
+            sym_name != NULL ? sym_name : "(none)",
+            filename != NULL ? filename : "(unknown)");
+
+    free(sym_name);
+    free(filename);
+    printed++;
+  }
+
+  if (printed == 0) {
+    fprintf(hotspots_file, "  (none detected)\n");
+  }
+
+  fprintf(hotspots_file, "\n");
 }
 
 static void decode_compressed_load_info(int inst, void *read_address,
@@ -529,8 +858,7 @@ static local_chain_counter_t *lookup_or_create_local_chain_counter(
   return local_counter;
 }
 
-static void write_stats(uint64_t total_occurrences, int unique_count,
-                        chain_entry_t *most_common) {
+static void write_stats(const analysis_data_t *analysis) {
   FILE *stats_file = fopen("stats.txt", "w");
 
   if (stats_file == NULL) {
@@ -555,26 +883,44 @@ static void write_stats(uint64_t total_occurrences, int unique_count,
 
   fprintf(stats_file, "\n[Chain Statistics]\n");
   fprintf(stats_file, "  Total executed               : %" PRIu64 "\n", g_total_instr);
-  fprintf(stats_file, "  LEJ chain occurrences (total): %" PRIu64 "\n", total_occurrences);
-  fprintf(stats_file, "  Unique LEJ chains detected   : %d\n", unique_count);
+  fprintf(stats_file, "  LEJ chain occurrences (total): %" PRIu64 "\n",
+          analysis->total_occurrences);
+  fprintf(stats_file, "  Unique LEJ chains detected   : %zu\n",
+          analysis->chain_count);
 
   if (g_total_instr > 0) {
     fprintf(stats_file, "  %% LEJ chains / Total : %.4f%%\n",
-            100.0 * (double)total_occurrences / (double)g_total_instr);
+            100.0 * (double)analysis->total_occurrences / (double)g_total_instr);
   }
 
-  if (most_common != NULL) {
+  if (analysis->most_common_chain != NULL) {
     fprintf(stats_file, "  Most occurred chain : chain_%d | %" PRIu64 " occurrences\n",
-            most_common->chain_id, most_common->count);
+            analysis->most_common_chain->chain_id,
+            analysis->most_common_chain->count);
   } else {
     fprintf(stats_file, "  Most occurred chain : (none detected)\n");
   }
+
+  fprintf(stats_file, "\n[Hotspot Summary]\n");
+  write_hotspot_summary(stats_file, "Hottest instruction site",
+                        analysis->hotspots_by_total, analysis->hotspot_count,
+                        HOTSPOT_ROLE_TOTAL, analysis->total_occurrences);
+  write_hotspot_summary(stats_file, "Hottest long producer",
+                        analysis->hotspots_by_long, analysis->hotspot_count,
+                        HOTSPOT_ROLE_LONG, analysis->total_occurrences);
+  write_hotspot_summary(stats_file, "Hottest expensive op",
+                        analysis->hotspots_by_expensive, analysis->hotspot_count,
+                        HOTSPOT_ROLE_EXPENSIVE, analysis->total_occurrences);
+  write_hotspot_summary(stats_file, "Hottest join consumer",
+                        analysis->hotspots_by_join, analysis->hotspot_count,
+                        HOTSPOT_ROLE_JOIN, analysis->total_occurrences);
+  fprintf(stats_file, "  Detailed hotspot report      : hotspots.txt\n");
 
   fclose(stats_file);
   fprintf(stderr, "[dep_chain] stats.txt written.\n");
 }
 
-static void write_chains(void) {
+static void write_chains(const analysis_data_t *analysis) {
   FILE *chains_file = fopen("chains.txt", "w");
 
   if (chains_file == NULL) {
@@ -585,12 +931,14 @@ static void write_chains(void) {
   fprintf(chains_file, "================================================\n");
   fprintf(chains_file, " LEJ Dependency Chain Detector -- Chain Detail\n");
   fprintf(chains_file, "================================================\n\n");
-  fprintf(chains_file, "chain_<id> | dep_regs: <rd_L>, <rd_E> | occurred <N> times\n");
+  fprintf(chains_file, "rank | chain_<id> | dep_regs: <rd_L>, <rd_E> | "
+          "occurred <N> times\n");
   fprintf(chains_file, "  <pc>  <instr>  # (L) producer  [sym | file]\n");
   fprintf(chains_file, "  <pc>  <instr>  # (E) producer  [sym | file]\n");
   fprintf(chains_file, "  <pc>  <instr>  # (J) consumer  [sym | file]\n\n");
 
-  for (chain_entry_t *entry = g_chain_list; entry != NULL; entry = entry->next) {
+  for (size_t rank = 0; rank < analysis->chain_count; rank++) {
+    chain_entry_t *entry = analysis->chains[rank];
     char *sym_l = NULL;
     char *sym_e = NULL;
     char *sym_j = NULL;
@@ -602,9 +950,15 @@ static void write_chains(void) {
     get_symbol_info_by_addr(entry->expensive_addr, &sym_e, NULL, &file_e);
     get_symbol_info_by_addr(entry->join_addr, &sym_j, NULL, &file_j);
 
-    fprintf(chains_file, "chain_%d | dep_regs: %s, %s | occurred %" PRIu64 " times\n",
-            entry->chain_id, reg_name(entry->dep_reg_l),
-            reg_name(entry->dep_reg_e), entry->count);
+    fprintf(chains_file,
+            "%4zu | chain_%d | dep_regs: %s, %s | occurred %" PRIu64
+            " times (%.4f%%)\n",
+            rank + 1, entry->chain_id, reg_name(entry->dep_reg_l),
+            reg_name(entry->dep_reg_e), entry->count,
+            analysis->total_occurrences > 0
+                ? (100.0 * (double)entry->count /
+                   (double)analysis->total_occurrences)
+                : 0.0);
     fprintf(chains_file, "  0x%016" PRIxPTR "  %-36s # (L) producer  [%s | %s]\n",
             entry->long_addr, entry->long_text,
             sym_l != NULL ? sym_l : "(none)",
@@ -629,6 +983,37 @@ static void write_chains(void) {
 
   fclose(chains_file);
   fprintf(stderr, "[dep_chain] chains.txt written.\n");
+}
+
+static void write_hotspots(const analysis_data_t *analysis) {
+  FILE *hotspots_file = fopen("hotspots.txt", "w");
+
+  if (hotspots_file == NULL) {
+    perror("[dep_chain] hotspots.txt");
+    return;
+  }
+
+  fprintf(hotspots_file, "================================================\n");
+  fprintf(hotspots_file, " LEJ Dependency Chain Detector -- Hotspot Report\n");
+  fprintf(hotspots_file, "================================================\n\n");
+  fprintf(hotspots_file, "Each count below is the number of LEJ chain "
+          "occurrences in which a static instruction participated.\n\n");
+
+  write_hotspot_section(hotspots_file, "[Overall Instruction Hotspots]",
+                        analysis->hotspots_by_total, analysis->hotspot_count,
+                        HOTSPOT_ROLE_TOTAL, analysis->total_occurrences);
+  write_hotspot_section(hotspots_file, "[Long Producer Hotspots]",
+                        analysis->hotspots_by_long, analysis->hotspot_count,
+                        HOTSPOT_ROLE_LONG, analysis->total_occurrences);
+  write_hotspot_section(hotspots_file, "[Expensive Producer Hotspots]",
+                        analysis->hotspots_by_expensive, analysis->hotspot_count,
+                        HOTSPOT_ROLE_EXPENSIVE, analysis->total_occurrences);
+  write_hotspot_section(hotspots_file, "[Join Consumer Hotspots]",
+                        analysis->hotspots_by_join, analysis->hotspot_count,
+                        HOTSPOT_ROLE_JOIN, analysis->total_occurrences);
+
+  fclose(hotspots_file);
+  fprintf(stderr, "[dep_chain] hotspots.txt written.\n");
 }
 
 int dependency_checker_pre_thread(mambo_context *ctx) {
@@ -754,23 +1139,15 @@ int dependency_checker_pre_inst(mambo_context *ctx) {
 }
 
 int dependency_checker_exit(mambo_context *ctx) {
-  uint64_t total_occurrences = 0;
-  int unique_count = 0;
-  chain_entry_t *most_common = NULL;
+  analysis_data_t analysis;
 
   (void)ctx;
 
-  for (chain_entry_t *entry = g_chain_list; entry != NULL; entry = entry->next) {
-    unique_count++;
-    total_occurrences += entry->count;
-
-    if (most_common == NULL || entry->count > most_common->count) {
-      most_common = entry;
-    }
-  }
-
-  write_stats(total_occurrences, unique_count, most_common);
-  write_chains();
+  prepare_analysis_data(&analysis);
+  write_stats(&analysis);
+  write_chains(&analysis);
+  write_hotspots(&analysis);
+  free_analysis_data(&analysis);
   return 0;
 }
 
