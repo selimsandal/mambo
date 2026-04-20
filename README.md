@@ -80,8 +80,12 @@ Sample plugins are available in the [`plugins/`](plugins) directory.
 The RISC-V-only [`plugins/dependency_checker.c`](plugins/dependency_checker.c)
 plugin detects LEJ chains (load -> expensive -> join) and writes `stats.txt`,
 `chains.txt`, and `hotspots.txt` when the instrumented application exits.
-A demo workload that exercises the dependency checker's report generation lives
-in [`examples/riscv_dependency_checker_demo.S`](examples/riscv_dependency_checker_demo.S).
+Demo workloads that exercise the dependency checker's report generation live in
+[`examples/riscv_dependency_checker_demo.c`](examples/riscv_dependency_checker_demo.c)
+and [`examples/riscv_dependency_checker_demo.S`](examples/riscv_dependency_checker_demo.S).
+The C demo uses `hotspot_start()` / `hotspot_end()` markers around the hot
+region via [`examples/hotspot_helpers.h`](examples/hotspot_helpers.h) while
+still exercising the dependency checker's own hotspot analysis.
 For a native `riscv64` container workflow on a real RISC-V host, see
 [`docker/README.md`](docker/README.md).
 

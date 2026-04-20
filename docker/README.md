@@ -27,8 +27,14 @@ The helper script:
 
 1. Verifies that the host architecture is `riscv64`
 2. Builds `mambo_dependency_checker` inside the container
-3. Compiles [`examples/riscv_dependency_checker_demo.S`](../examples/riscv_dependency_checker_demo.S)
+3. Compiles [`examples/riscv_dependency_checker_demo.c`](../examples/riscv_dependency_checker_demo.c) by default
 4. Runs the demo under MAMBO and leaves `stats.txt`, `chains.txt`, and `hotspots.txt` in the host artifact directory
+
+The default C demo uses `hotspot_start()` / `hotspot_end()` markers from
+[`examples/hotspot_helpers.h`](../examples/hotspot_helpers.h) around the
+interesting region while still relying on `plugins/dependency_checker.c` for
+the actual hotspot report. To run the assembly version instead, set
+`DEMO_SOURCE=examples/riscv_dependency_checker_demo.S`.
 
 The remaining sections below describe the older QEMU guest-image workflow for
 ARM64 and RISC-V.

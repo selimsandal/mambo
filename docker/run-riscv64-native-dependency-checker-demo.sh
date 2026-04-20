@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 IMAGE_NAME=${IMAGE_NAME:-mambo-riscv64-native-demo}
 ARTIFACT_DIR=${ARTIFACT_DIR:-"$REPO_ROOT/.demo-artifacts/riscv_dependency_checker"}
+DEMO_SOURCE=${DEMO_SOURCE:-examples/riscv_dependency_checker_demo.c}
 
 if [[ $(uname -m) != "riscv64" ]]; then
   echo "This workflow is intended for a native riscv64 host." >&2
@@ -24,14 +25,27 @@ docker build -f "$SCRIPT_DIR/Dockerfile.riscv64-native" -t "$IMAGE_NAME" "$REPO_
 docker run --rm \
   -v "$REPO_ROOT:/workspace/mambo" \
   -v "$ARTIFACT_DIR:/artifacts" \
+  -e DEMO_SOURCE="$DEMO_SOURCE" \
   -w /workspace/mambo \
   "$IMAGE_NAME" \
   bash -lc '
     set -euo pipefail
     echo "container uname -m: $(uname -m)"
     make dependency_checker
-    gcc -O2 -o /tmp/riscv_dependency_checker_demo \
-      /workspace/mambo/examples/riscv_dependency_checker_demo.S
+    case "$DEMO_SOURCE" in
+      *.c)
+        gcc -O2 -fno-inline -o /tmp/riscv_dependency_checker_demo \
+          "/workspace/mambo/$DEMO_SOURCE"
+        ;;
+      *.S)
+        gcc -O2 -o /tmp/riscv_dependency_checker_demo \
+          "/workspace/mambo/$DEMO_SOURCE"
+        ;;
+      *)
+        echo "Unsupported demo source: $DEMO_SOURCE" >&2
+        exit 1
+        ;;
+    esac
     rm -f /artifacts/stats.txt /artifacts/chains.txt /artifacts/hotspots.txt
     cd /artifacts
     /workspace/mambo/mambo_dependency_checker /tmp/riscv_dependency_checker_demo
