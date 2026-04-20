@@ -2,7 +2,7 @@
   LEJ dependency chain detector plugin for MAMBO.
 
   L: long-latency load instructions
-  E: expensive arithmetic instructions (mul/div/fmul/fdiv)
+  E: expensive arithmetic instructions (mul/div/rem/fmul/fdiv)
   J: join instructions that consume both dependency chains within a bounded
      instruction window
 */
@@ -34,8 +34,19 @@ typedef enum {
   INST_EXPENSIVE = 2,
 } inst_class_t;
 
+typedef enum {
+  EXPENSIVE_KIND_NONE = 0,
+  EXPENSIVE_KIND_MUL = 1,
+  EXPENSIVE_KIND_DIV = 2,
+  EXPENSIVE_KIND_REM = 3,
+  EXPENSIVE_KIND_FMUL = 4,
+  EXPENSIVE_KIND_FDIV = 5,
+  EXPENSIVE_KIND_COUNT = 6,
+} expensive_kind_t;
+
 typedef struct {
   inst_class_t iclass;
+  expensive_kind_t expensive_kind;
   int dest_reg;
   int src_reg[2];
   uintptr_t pc;
@@ -51,6 +62,7 @@ struct chain_entry {
   int dep_reg_l;
   int dep_reg_e;
   int chain_id;
+  expensive_kind_t expensive_kind;
   char long_text[80];
   char expensive_text[80];
   char join_text[80];
@@ -77,6 +89,7 @@ typedef struct {
   uint64_t long_count;
   uint64_t expensive_count;
   uint64_t join_count;
+  uint64_t expensive_kind_counts[EXPENSIVE_KIND_COUNT];
   const char *text;
 } hotspot_entry_t;
 
@@ -84,6 +97,8 @@ typedef struct {
   chain_entry_t **chains;
   size_t chain_count;
   uint64_t total_occurrences;
+  uint64_t chain_occurrences_by_kind[EXPENSIVE_KIND_COUNT];
+  size_t unique_chains_by_kind[EXPENSIVE_KIND_COUNT];
   chain_entry_t *most_common_chain;
   hotspot_entry_t *hotspots;
   size_t hotspot_count;
@@ -97,6 +112,7 @@ typedef struct {
   uint64_t total_instr;
   uint64_t total_long;
   uint64_t total_expensive;
+  uint64_t total_expensive_by_kind[EXPENSIVE_KIND_COUNT];
   inst_info_t window[WINDOW_SIZE];
   int window_count;
   mambo_ht_t *chain_map; // hash -> local_chain_counter_t* collision list
@@ -108,6 +124,7 @@ static int g_next_chain_id = 1;
 static uint64_t g_total_instr = 0;
 static uint64_t g_total_long = 0;
 static uint64_t g_total_expensive = 0;
+static uint64_t g_total_expensive_by_kind[EXPENSIVE_KIND_COUNT] = {0};
 
 static const char *const rv_reg_abi[32] = {
   "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
@@ -144,6 +161,79 @@ static const char *reg_name(int reg) {
   }
 
   return "?";
+}
+
+static const char *expensive_kind_name(expensive_kind_t kind) {
+  switch (kind) {
+    case EXPENSIVE_KIND_MUL:
+      return "mul";
+    case EXPENSIVE_KIND_DIV:
+      return "div";
+    case EXPENSIVE_KIND_REM:
+      return "rem";
+    case EXPENSIVE_KIND_FMUL:
+      return "fmul";
+    case EXPENSIVE_KIND_FDIV:
+      return "fdiv";
+    case EXPENSIVE_KIND_NONE:
+    case EXPENSIVE_KIND_COUNT:
+      break;
+  }
+
+  return "none";
+}
+
+static const char *expensive_kind_summary_label(expensive_kind_t kind) {
+  switch (kind) {
+    case EXPENSIVE_KIND_MUL:
+      return "Integer mul family";
+    case EXPENSIVE_KIND_DIV:
+      return "Integer div family";
+    case EXPENSIVE_KIND_REM:
+      return "Integer rem family";
+    case EXPENSIVE_KIND_FMUL:
+      return "FP mul family";
+    case EXPENSIVE_KIND_FDIV:
+      return "FP div family";
+    case EXPENSIVE_KIND_NONE:
+    case EXPENSIVE_KIND_COUNT:
+      break;
+  }
+
+  return "Unknown family";
+}
+
+static void write_expensive_kind_breakdown(FILE *file, const uint64_t *counts,
+                                           uint64_t total_count,
+                                           const size_t *unique_counts) {
+  for (int kind = EXPENSIVE_KIND_MUL; kind < EXPENSIVE_KIND_COUNT; kind++) {
+    expensive_kind_t expensive_kind = (expensive_kind_t)kind;
+
+    fprintf(file, "  %-25s: %" PRIu64,
+            expensive_kind_summary_label(expensive_kind), counts[kind]);
+
+    if (unique_counts != NULL) {
+      fprintf(file, " occurrences across %zu unique chains",
+              unique_counts[kind]);
+    } else {
+      fprintf(file, " executed");
+    }
+
+    if (total_count > 0) {
+      fprintf(file, " (%.4f%%)",
+              100.0 * (double)counts[kind] / (double)total_count);
+    }
+
+    fprintf(file, "\n");
+  }
+}
+
+static void write_expensive_kind_counts(FILE *file, const uint64_t *counts) {
+  fprintf(file, "mul/div/rem/fmul/fdiv = %" PRIu64 "/%" PRIu64 "/%" PRIu64
+          "/%" PRIu64 "/%" PRIu64,
+          counts[EXPENSIVE_KIND_MUL], counts[EXPENSIVE_KIND_DIV],
+          counts[EXPENSIVE_KIND_REM], counts[EXPENSIVE_KIND_FMUL],
+          counts[EXPENSIVE_KIND_FDIV]);
 }
 
 static uintptr_t hash_chain_key(uintptr_t long_addr, uintptr_t expensive_addr,
@@ -296,11 +386,16 @@ static hotspot_entry_t *lookup_or_create_hotspot(mambo_ht_t *hotspot_map,
 static void add_hotspot_count(mambo_ht_t *hotspot_map, hotspot_entry_t *hotspots,
                               size_t *hotspot_count, uintptr_t pc,
                               const char *text, hotspot_role_t role,
+                              expensive_kind_t expensive_kind,
                               uint64_t count) {
   hotspot_entry_t *entry =
       lookup_or_create_hotspot(hotspot_map, hotspots, hotspot_count, pc, text);
 
   entry->total_count += count;
+  if (expensive_kind > EXPENSIVE_KIND_NONE &&
+      expensive_kind < EXPENSIVE_KIND_COUNT) {
+    entry->expensive_kind_counts[expensive_kind] += count;
+  }
 
   switch (role) {
     case HOTSPOT_ROLE_TOTAL:
@@ -357,15 +452,23 @@ static void prepare_analysis_data(analysis_data_t *analysis) {
 
   for (chain_entry_t *entry = g_chain_list; entry != NULL; entry = entry->next) {
     analysis->chains[chain_index++] = entry;
+    if (entry->expensive_kind > EXPENSIVE_KIND_NONE &&
+        entry->expensive_kind < EXPENSIVE_KIND_COUNT) {
+      analysis->chain_occurrences_by_kind[entry->expensive_kind] += entry->count;
+      analysis->unique_chains_by_kind[entry->expensive_kind]++;
+    }
 
     add_hotspot_count(&hotspot_map, analysis->hotspots, &analysis->hotspot_count,
                       entry->long_addr, entry->long_text, HOTSPOT_ROLE_LONG,
+                      entry->expensive_kind,
                       entry->count);
     add_hotspot_count(&hotspot_map, analysis->hotspots, &analysis->hotspot_count,
                       entry->expensive_addr, entry->expensive_text,
-                      HOTSPOT_ROLE_EXPENSIVE, entry->count);
+                      HOTSPOT_ROLE_EXPENSIVE, entry->expensive_kind,
+                      entry->count);
     add_hotspot_count(&hotspot_map, analysis->hotspots, &analysis->hotspot_count,
                       entry->join_addr, entry->join_text, HOTSPOT_ROLE_JOIN,
+                      entry->expensive_kind,
                       entry->count);
   }
 
@@ -457,6 +560,9 @@ static void write_hotspot_section(FILE *hotspots_file, const char *title,
                 ? (100.0 * (double)count / (double)total_occurrences)
                 : 0.0,
             entry->long_count, entry->expensive_count, entry->join_count);
+    fprintf(hotspots_file, "      expensive kinds ");
+    write_expensive_kind_counts(hotspots_file, entry->expensive_kind_counts);
+    fprintf(hotspots_file, "\n");
     fprintf(hotspots_file, "      0x%016" PRIxPTR "  %-36s  [%s | %s]\n",
             entry->pc,
             entry->text != NULL ? entry->text : "(unknown)",
@@ -544,6 +650,7 @@ static void decode_inst_info(mambo_context *ctx, inst_info_t *info) {
   unsigned int imm_f;
 
   info->iclass = INST_OTHER;
+  info->expensive_kind = EXPENSIVE_KIND_NONE;
   info->dest_reg = -1;
   info->src_reg[0] = -1;
   info->src_reg[1] = -1;
@@ -613,9 +720,11 @@ static void decode_inst_info(mambo_context *ctx, inst_info_t *info) {
     case RISCV_DIVUW:
     case RISCV_REMW:
     case RISCV_REMUW: {
+      expensive_kind_t expensive_kind = EXPENSIVE_KIND_MUL;
       riscv_add_decode_fields((uint16_t *)ctx->code.read_address,
                               &rd_f, &rs1_f, &rs2_f);
       info->iclass = INST_EXPENSIVE;
+      info->expensive_kind = EXPENSIVE_KIND_MUL;
       info->dest_reg = encode_gpr_dest(rd_f);
       info->src_reg[0] = encode_gpr_src(rs1_f);
       info->src_reg[1] = encode_gpr_src(rs2_f);
@@ -625,14 +734,17 @@ static void decode_inst_info(mambo_context *ctx, inst_info_t *info) {
         (inst == RISCV_MULH) ? "mulh" :
         (inst == RISCV_MULHSU) ? "mulhsu" :
         (inst == RISCV_MULHU) ? "mulhu" :
-        (inst == RISCV_DIV) ? "div" :
-        (inst == RISCV_DIVU) ? "divu" :
-        (inst == RISCV_REM) ? "rem" :
-        (inst == RISCV_REMU) ? "remu" :
+        (inst == RISCV_DIV) ? (expensive_kind = EXPENSIVE_KIND_DIV, "div") :
+        (inst == RISCV_DIVU) ? (expensive_kind = EXPENSIVE_KIND_DIV, "divu") :
+        (inst == RISCV_REM) ? (expensive_kind = EXPENSIVE_KIND_REM, "rem") :
+        (inst == RISCV_REMU) ? (expensive_kind = EXPENSIVE_KIND_REM, "remu") :
         (inst == RISCV_MULW) ? "mulw" :
-        (inst == RISCV_DIVW) ? "divw" :
-        (inst == RISCV_DIVUW) ? "divuw" :
-        (inst == RISCV_REMW) ? "remw" : "remuw";
+        (inst == RISCV_DIVW) ? (expensive_kind = EXPENSIVE_KIND_DIV, "divw") :
+        (inst == RISCV_DIVUW) ? (expensive_kind = EXPENSIVE_KIND_DIV, "divuw") :
+        (inst == RISCV_REMW) ? (expensive_kind = EXPENSIVE_KIND_REM, "remw") :
+        (expensive_kind = EXPENSIVE_KIND_REM, "remuw");
+
+      info->expensive_kind = expensive_kind;
 
       snprintf(info->text, sizeof(info->text), "%s %s, %s, %s",
                mnemonic, reg_name(info->dest_reg), reg_name(info->src_reg[0]),
@@ -646,6 +758,10 @@ static void decode_inst_info(mambo_context *ctx, inst_info_t *info) {
       riscv_add_decode_fields((uint16_t *)ctx->code.read_address,
                               &rd_f, &rs1_f, &rs2_f);
       info->iclass = INST_EXPENSIVE;
+      info->expensive_kind =
+          (inst == RISCV_FDIV_S || inst == RISCV_FDIV_D)
+              ? EXPENSIVE_KIND_FDIV
+              : EXPENSIVE_KIND_FMUL;
       info->dest_reg = encode_fpr(rd_f);
       info->src_reg[0] = encode_fpr(rs1_f);
       info->src_reg[1] = encode_fpr(rs2_f);
@@ -809,6 +925,7 @@ static chain_entry_t *lookup_or_create_global_chain(mambo_context *ctx,
     entry->dep_reg_l = rd_l;
     entry->dep_reg_e = rd_e;
     entry->chain_id = g_next_chain_id++;
+    entry->expensive_kind = expensive_inst->expensive_kind;
 
     strncpy(entry->long_text, long_inst->text, sizeof(entry->long_text) - 1);
     strncpy(entry->expensive_text, expensive_inst->text,
@@ -871,7 +988,8 @@ static void write_stats(const analysis_data_t *analysis) {
   fprintf(stats_file, "================================================\n\n");
   fprintf(stats_file, "[Instruction Counts]\n");
   fprintf(stats_file, "  Total executed               : %" PRIu64 "\n", g_total_instr);
-  fprintf(stats_file, "  Expensive (mul/div/fmul/fdiv): %" PRIu64 "\n", g_total_expensive);
+  fprintf(stats_file, "  Expensive (mul/div/rem/fmul/fdiv): %" PRIu64 "\n",
+          g_total_expensive);
   fprintf(stats_file, "  Long      (load)             : %" PRIu64 "\n", g_total_long);
 
   if (g_total_instr > 0) {
@@ -880,6 +998,10 @@ static void write_stats(const analysis_data_t *analysis) {
     fprintf(stats_file, "  %% Long      / Total : %.4f%%\n",
             100.0 * (double)g_total_long / (double)g_total_instr);
   }
+
+  fprintf(stats_file, "\n[Expensive Instruction Breakdown]\n");
+  write_expensive_kind_breakdown(stats_file, g_total_expensive_by_kind,
+                                 g_total_expensive, NULL);
 
   fprintf(stats_file, "\n[Chain Statistics]\n");
   fprintf(stats_file, "  Total executed               : %" PRIu64 "\n", g_total_instr);
@@ -900,6 +1022,11 @@ static void write_stats(const analysis_data_t *analysis) {
   } else {
     fprintf(stats_file, "  Most occurred chain : (none detected)\n");
   }
+
+  fprintf(stats_file, "\n[Chain Breakdown By Expensive Op]\n");
+  write_expensive_kind_breakdown(stats_file, analysis->chain_occurrences_by_kind,
+                                 analysis->total_occurrences,
+                                 analysis->unique_chains_by_kind);
 
   fprintf(stats_file, "\n[Hotspot Summary]\n");
   write_hotspot_summary(stats_file, "Hottest instruction site",
@@ -931,8 +1058,13 @@ static void write_chains(const analysis_data_t *analysis) {
   fprintf(chains_file, "================================================\n");
   fprintf(chains_file, " LEJ Dependency Chain Detector -- Chain Detail\n");
   fprintf(chains_file, "================================================\n\n");
-  fprintf(chains_file, "rank | chain_<id> | dep_regs: <rd_L>, <rd_E> | "
-          "occurred <N> times\n");
+  fprintf(chains_file, "[Chain Breakdown By Expensive Op]\n");
+  write_expensive_kind_breakdown(chains_file, analysis->chain_occurrences_by_kind,
+                                 analysis->total_occurrences,
+                                 analysis->unique_chains_by_kind);
+  fprintf(chains_file, "\n");
+  fprintf(chains_file, "rank | chain_<id> | expensive=<kind> | dep_regs: <rd_L>, "
+          "<rd_E> | occurred <N> times\n");
   fprintf(chains_file, "  <pc>  <instr>  # (L) producer  [sym | file]\n");
   fprintf(chains_file, "  <pc>  <instr>  # (E) producer  [sym | file]\n");
   fprintf(chains_file, "  <pc>  <instr>  # (J) consumer  [sym | file]\n\n");
@@ -951,10 +1083,10 @@ static void write_chains(const analysis_data_t *analysis) {
     get_symbol_info_by_addr(entry->join_addr, &sym_j, NULL, &file_j);
 
     fprintf(chains_file,
-            "%4zu | chain_%d | dep_regs: %s, %s | occurred %" PRIu64
-            " times (%.4f%%)\n",
-            rank + 1, entry->chain_id, reg_name(entry->dep_reg_l),
-            reg_name(entry->dep_reg_e), entry->count,
+            "%4zu | chain_%d | expensive=%-4s | dep_regs: %s, %s | occurred "
+            "%" PRIu64 " times (%.4f%%)\n",
+            rank + 1, entry->chain_id, expensive_kind_name(entry->expensive_kind),
+            reg_name(entry->dep_reg_l), reg_name(entry->dep_reg_e), entry->count,
             analysis->total_occurrences > 0
                 ? (100.0 * (double)entry->count /
                    (double)analysis->total_occurrences)
@@ -997,7 +1129,9 @@ static void write_hotspots(const analysis_data_t *analysis) {
   fprintf(hotspots_file, " LEJ Dependency Chain Detector -- Hotspot Report\n");
   fprintf(hotspots_file, "================================================\n\n");
   fprintf(hotspots_file, "Each count below is the number of LEJ chain "
-          "occurrences in which a static instruction participated.\n\n");
+          "occurrences in which a static instruction participated.\n");
+  fprintf(hotspots_file, "Expensive-kind counts track which expensive-op "
+          "family each chain occurrence used.\n\n");
 
   write_hotspot_section(hotspots_file, "[Overall Instruction Hotspots]",
                         analysis->hotspots_by_total, analysis->hotspot_count,
@@ -1038,6 +1172,10 @@ int dependency_checker_post_thread(mambo_context *ctx) {
   atomic_increment_u64(&g_total_instr, t_data->total_instr);
   atomic_increment_u64(&g_total_long, t_data->total_long);
   atomic_increment_u64(&g_total_expensive, t_data->total_expensive);
+  for (int kind = EXPENSIVE_KIND_MUL; kind < EXPENSIVE_KIND_COUNT; kind++) {
+    atomic_increment_u64(&g_total_expensive_by_kind[kind],
+                         t_data->total_expensive_by_kind[kind]);
+  }
 
   fprintf(stderr, "[dep_chain] thread %d exited - total=%" PRIu64
           " long=%" PRIu64 " expensive=%" PRIu64 "\n",
@@ -1091,6 +1229,12 @@ int dependency_checker_pre_inst(mambo_context *ctx) {
     emit_counter64_incr(ctx, &t_data->total_long, 1);
   } else if (curr_inst.iclass == INST_EXPENSIVE) {
     emit_counter64_incr(ctx, &t_data->total_expensive, 1);
+    if (curr_inst.expensive_kind > EXPENSIVE_KIND_NONE &&
+        curr_inst.expensive_kind < EXPENSIVE_KIND_COUNT) {
+      emit_counter64_incr(ctx,
+                          &t_data->total_expensive_by_kind[curr_inst.expensive_kind],
+                          1);
+    }
   }
 
   if (curr_inst.src_reg[0] >= 0 && curr_inst.src_reg[1] >= 0) {

@@ -11,6 +11,28 @@ Docker is required. Please see the following instructions to install docker on y
 3. Run the docker image we just created using the following command: `docker run -t -i mambo`
 4. You will now be in the home directory of the docker container. Two directories are available `aarch64` for those wishing to use MAMBO on ARM64, and `riscv` for those wishing to use MAMBO on RISC-V. Navigate to the desired directory and follow the instructions for each architecure in the relevant section below.
 
+## Native RISC-V container workflow
+
+This path is for a real `riscv64` Linux host running Docker natively. It does
+not boot a guest image under QEMU, and it is the recommended way to exercise
+the RISC-V-only dependency checker without involving an ARM or x86 host/guest
+setup.
+
+1. Change to the MAMBO repository root.
+2. Build the native container image: `docker build -f docker/Dockerfile.riscv64-native -t mambo-riscv64-native-demo .`
+3. Run the helper script: `./docker/run-riscv64-native-dependency-checker-demo.sh`
+4. Inspect the generated reports in `.demo-artifacts/riscv_dependency_checker/`.
+
+The helper script:
+
+1. Verifies that the host architecture is `riscv64`
+2. Builds `mambo_dependency_checker` inside the container
+3. Compiles [`examples/riscv_dependency_checker_demo.S`](../examples/riscv_dependency_checker_demo.S)
+4. Runs the demo under MAMBO and leaves `stats.txt`, `chains.txt`, and `hotspots.txt` in the host artifact directory
+
+The remaining sections below describe the older QEMU guest-image workflow for
+ARM64 and RISC-V.
+
 ## MAMBO on ARM64
 
 ### Running on a non-ARM64 machine
