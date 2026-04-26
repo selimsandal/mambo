@@ -88,6 +88,12 @@ region via [`examples/hotspot_helpers.h`](examples/hotspot_helpers.h) while
 still exercising the dependency checker's own hotspot analysis.
 For a native `riscv64` container workflow on a real RISC-V host, see
 [`docker/README.md`](docker/README.md).
+For a host-native SPEC CPU2017 test workflow on a real `riscv64` machine,
+[`scripts/prepare-jammy-libc-riscv64.sh`](scripts/prepare-jammy-libc-riscv64.sh)
+downloads a generic Ubuntu `jammy` `libc6` package and
+[`scripts/run-riscv64-spec2017-505-mcf-test.sh`](scripts/run-riscv64-spec2017-505-mcf-test.sh)
+builds `mambo_dependency_checker`, generates a conservative duplicate SPEC
+config, and runs/verifies `505.mcf_r` test input under MAMBO.
 
 To build MAMBO with plugin support, the source code or object file(s) of the plugin you're trying to build must be added to the `PLUGINS=` line in the `makefile`, or provided as an argument/envvar. Note that multiple plugins can be enabled at the same time (and will work correctly if properly designed). For performance reasons, it is recommended to remove unused plugins from the `PLUGINS=` list. Additional arguments that are required to build the plugins can be provided through `PLUGIN_ARGS`.
 The dependency checker can also be built directly with `make dependency_checker`,

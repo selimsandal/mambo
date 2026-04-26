@@ -1,6 +1,8 @@
 dbm
+mambo_dependency_checker
 api/emit_*.c
 api/emit_*.h
 elf/elf_loader.o
 elf/symbol_parser.o
+.demo-artifacts/
 .vscode/

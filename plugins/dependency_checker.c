@@ -26,6 +26,8 @@
 #define WINDOW_SIZE 16
 #define MAX_GAP 4
 #define CHAIN_MAP_INIT 1024
+#define EXEC_SITE_MAP_INIT 4096
+#define GLOBAL_EXEC_SITE_MAP_INIT 16384
 #define HOTSPOT_TOP_LIMIT 20
 
 typedef enum {
@@ -76,6 +78,20 @@ struct local_chain_counter {
   local_chain_counter_t *next;
 };
 
+typedef struct {
+  uintptr_t pc;
+  uint64_t count;
+  char text[80];
+} local_exec_counter_t;
+
+typedef struct exec_site_entry exec_site_entry_t;
+struct exec_site_entry {
+  uintptr_t pc;
+  uint64_t count;
+  char text[80];
+  exec_site_entry_t *next;
+};
+
 typedef enum {
   HOTSPOT_ROLE_TOTAL = 0,
   HOTSPOT_ROLE_LONG = 1,
@@ -86,6 +102,7 @@ typedef enum {
 typedef struct {
   uintptr_t pc;
   uint64_t total_count;
+  uint64_t executed_count;
   uint64_t long_count;
   uint64_t expensive_count;
   uint64_t join_count;
@@ -116,10 +133,13 @@ typedef struct {
   inst_info_t window[WINDOW_SIZE];
   int window_count;
   mambo_ht_t *chain_map; // hash -> local_chain_counter_t* collision list
+  mambo_ht_t *exec_site_map; // pc -> local_exec_counter_t*
 } thread_data_t;
 
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static chain_entry_t *g_chain_list = NULL;
+static exec_site_entry_t *g_exec_site_list = NULL;
+static mambo_ht_t g_exec_site_map;
 static int g_next_chain_id = 1;
 static uint64_t g_total_instr = 0;
 static uint64_t g_total_long = 0;
@@ -236,6 +256,12 @@ static void write_expensive_kind_counts(FILE *file, const uint64_t *counts) {
           counts[EXPENSIVE_KIND_FDIV]);
 }
 
+static double percentage_u64(uint64_t numerator, uint64_t denominator) {
+  return denominator > 0
+             ? (100.0 * (double)numerator / (double)denominator)
+             : 0.0;
+}
+
 static uintptr_t hash_chain_key(uintptr_t long_addr, uintptr_t expensive_addr,
                                 uintptr_t join_addr) {
   uintptr_t key = long_addr;
@@ -254,6 +280,13 @@ static bool chain_matches(const chain_entry_t *entry, uintptr_t long_addr,
          entry->join_addr == join_addr;
 }
 
+static bool should_track_site_execution(const inst_info_t *info) {
+  return info->pc != 0 &&
+         (info->iclass == INST_LONG ||
+          info->iclass == INST_EXPENSIVE ||
+          (info->src_reg[0] >= 0 && info->src_reg[1] >= 0));
+}
+
 static chain_entry_t *find_global_chain(uintptr_t long_addr,
                                         uintptr_t expensive_addr,
                                         uintptr_t join_addr) {
@@ -264,6 +297,44 @@ static chain_entry_t *find_global_chain(uintptr_t long_addr,
   }
 
   return NULL;
+}
+
+static exec_site_entry_t *lookup_or_create_global_exec_site(mambo_context *ctx,
+                                                            uintptr_t pc,
+                                                            const char *text) {
+  uintptr_t value = 0;
+  exec_site_entry_t *entry = NULL;
+
+  pthread_mutex_lock(&g_mutex);
+
+  if (mambo_ht_get_nolock(&g_exec_site_map, pc, &value) == 0) {
+    entry = (exec_site_entry_t *)value;
+  } else {
+    entry = (exec_site_entry_t *)mambo_alloc(ctx, sizeof(*entry));
+    assert(entry != NULL);
+    memset(entry, 0, sizeof(*entry));
+
+    entry->pc = pc;
+    strncpy(entry->text, text, sizeof(entry->text) - 1);
+    entry->next = g_exec_site_list;
+    g_exec_site_list = entry;
+
+    assert(mambo_ht_add_nolock(&g_exec_site_map, pc, (uintptr_t)entry) == 0);
+  }
+
+  pthread_mutex_unlock(&g_mutex);
+
+  return entry;
+}
+
+static uint64_t lookup_global_exec_count(uintptr_t pc) {
+  uintptr_t value = 0;
+
+  if (mambo_ht_get(&g_exec_site_map, pc, &value) == 0) {
+    return ((exec_site_entry_t *)value)->count;
+  }
+
+  return 0;
 }
 
 static int compare_chain_rank_desc(const void *lhs, const void *rhs) {
@@ -472,6 +543,11 @@ static void prepare_analysis_data(analysis_data_t *analysis) {
                       entry->count);
   }
 
+  for (size_t index = 0; index < analysis->hotspot_count; index++) {
+    analysis->hotspots[index].executed_count =
+        lookup_global_exec_count(analysis->hotspots[index].pc);
+  }
+
   qsort(analysis->chains, analysis->chain_count, sizeof(*analysis->chains),
         compare_chain_rank_desc);
 
@@ -522,11 +598,10 @@ static void write_hotspot_summary(FILE *stats_file, const char *label,
   uint64_t count = hotspot_role_count(entry, role);
 
   fprintf(stats_file, "  %-26s: 0x%" PRIxPTR " | %" PRIu64
-          " occurrences (%.4f%%) | %s\n",
-          label, entry->pc, count,
-          total_occurrences > 0
-              ? (100.0 * (double)count / (double)total_occurrences)
-              : 0.0,
+          " chain hits / %" PRIu64 " execs | chain share %.4f%% | coverage %.4f%% | %s\n",
+          label, entry->pc, count, entry->executed_count,
+          percentage_u64(count, total_occurrences),
+          percentage_u64(count, entry->executed_count),
           entry->text != NULL ? entry->text : "(unknown)");
 }
 
@@ -553,12 +628,13 @@ static void write_hotspot_section(FILE *hotspots_file, const char *title,
     get_symbol_info_by_addr(entry->pc, &sym_name, NULL, &filename);
 
     fprintf(hotspots_file,
-            "  %2zu. %" PRIu64 " occurrences (%.4f%%) | roles L/E/J = "
+            "  %2zu. %" PRIu64 " chain hits | %" PRIu64
+            " execs | chain share %.4f%% | coverage %.4f%% | roles L/E/J = "
             "%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
             printed + 1, count,
-            total_occurrences > 0
-                ? (100.0 * (double)count / (double)total_occurrences)
-                : 0.0,
+            entry->executed_count,
+            percentage_u64(count, total_occurrences),
+            percentage_u64(count, entry->executed_count),
             entry->long_count, entry->expensive_count, entry->join_count);
     fprintf(hotspots_file, "      expensive kinds ");
     write_expensive_kind_counts(hotspots_file, entry->expensive_kind_counts);
@@ -975,6 +1051,26 @@ static local_chain_counter_t *lookup_or_create_local_chain_counter(
   return local_counter;
 }
 
+static local_exec_counter_t *lookup_or_create_local_exec_counter(
+    mambo_context *ctx, thread_data_t *t_data, const inst_info_t *inst) {
+  uintptr_t value = 0;
+  local_exec_counter_t *entry = NULL;
+
+  if (mambo_ht_get(t_data->exec_site_map, inst->pc, &value) == 0) {
+    return (local_exec_counter_t *)value;
+  }
+
+  entry = (local_exec_counter_t *)mambo_alloc(ctx, sizeof(*entry));
+  assert(entry != NULL);
+  memset(entry, 0, sizeof(*entry));
+
+  entry->pc = inst->pc;
+  strncpy(entry->text, inst->text, sizeof(entry->text) - 1);
+  assert(mambo_ht_add(t_data->exec_site_map, inst->pc, (uintptr_t)entry) == 0);
+
+  return entry;
+}
+
 static void write_stats(const analysis_data_t *analysis) {
   FILE *stats_file = fopen("stats.txt", "w");
 
@@ -1016,9 +1112,16 @@ static void write_stats(const analysis_data_t *analysis) {
   }
 
   if (analysis->most_common_chain != NULL) {
-    fprintf(stats_file, "  Most occurred chain : chain_%d | %" PRIu64 " occurrences\n",
+    uint64_t anchor_exec_count =
+        lookup_global_exec_count(analysis->most_common_chain->long_addr);
+    fprintf(stats_file,
+            "  Most occurred chain : chain_%d | %" PRIu64
+            " occurrences | long-site execs %" PRIu64 " | coverage %.4f%%\n",
             analysis->most_common_chain->chain_id,
-            analysis->most_common_chain->count);
+            analysis->most_common_chain->count,
+            anchor_exec_count,
+            percentage_u64(analysis->most_common_chain->count,
+                           anchor_exec_count));
   } else {
     fprintf(stats_file, "  Most occurred chain : (none detected)\n");
   }
@@ -1064,13 +1167,15 @@ static void write_chains(const analysis_data_t *analysis) {
                                  analysis->unique_chains_by_kind);
   fprintf(chains_file, "\n");
   fprintf(chains_file, "rank | chain_<id> | expensive=<kind> | dep_regs: <rd_L>, "
-          "<rd_E> | occurred <N> times\n");
+          "<rd_E> | occurred <N> times | long-site coverage = occurrences / "
+          "long-site execs\n");
   fprintf(chains_file, "  <pc>  <instr>  # (L) producer  [sym | file]\n");
   fprintf(chains_file, "  <pc>  <instr>  # (E) producer  [sym | file]\n");
   fprintf(chains_file, "  <pc>  <instr>  # (J) consumer  [sym | file]\n\n");
 
   for (size_t rank = 0; rank < analysis->chain_count; rank++) {
     chain_entry_t *entry = analysis->chains[rank];
+    uint64_t anchor_exec_count = lookup_global_exec_count(entry->long_addr);
     char *sym_l = NULL;
     char *sym_e = NULL;
     char *sym_j = NULL;
@@ -1084,13 +1189,13 @@ static void write_chains(const analysis_data_t *analysis) {
 
     fprintf(chains_file,
             "%4zu | chain_%d | expensive=%-4s | dep_regs: %s, %s | occurred "
-            "%" PRIu64 " times (%.4f%%)\n",
+            "%" PRIu64 " times (%.4f%%) | long-site execs %" PRIu64
+            " | coverage %.4f%%\n",
             rank + 1, entry->chain_id, expensive_kind_name(entry->expensive_kind),
             reg_name(entry->dep_reg_l), reg_name(entry->dep_reg_e), entry->count,
-            analysis->total_occurrences > 0
-                ? (100.0 * (double)entry->count /
-                   (double)analysis->total_occurrences)
-                : 0.0);
+            percentage_u64(entry->count, analysis->total_occurrences),
+            anchor_exec_count,
+            percentage_u64(entry->count, anchor_exec_count));
     fprintf(chains_file, "  0x%016" PRIxPTR "  %-36s # (L) producer  [%s | %s]\n",
             entry->long_addr, entry->long_text,
             sym_l != NULL ? sym_l : "(none)",
@@ -1130,6 +1235,8 @@ static void write_hotspots(const analysis_data_t *analysis) {
   fprintf(hotspots_file, "================================================\n\n");
   fprintf(hotspots_file, "Each count below is the number of LEJ chain "
           "occurrences in which a static instruction participated.\n");
+  fprintf(hotspots_file, "The coverage metric is chain hits divided by total "
+          "executions of that static instruction.\n");
   fprintf(hotspots_file, "Expensive-kind counts track which expensive-op "
           "family each chain occurrence used.\n\n");
 
@@ -1159,6 +1266,9 @@ int dependency_checker_pre_thread(mambo_context *ctx) {
   t_data->chain_map = (mambo_ht_t *)mambo_alloc(ctx, sizeof(mambo_ht_t));
   assert(t_data->chain_map != NULL);
   assert(mambo_ht_init(t_data->chain_map, CHAIN_MAP_INIT, 0, 80, true) == 0);
+  t_data->exec_site_map = (mambo_ht_t *)mambo_alloc(ctx, sizeof(mambo_ht_t));
+  assert(t_data->exec_site_map != NULL);
+  assert(mambo_ht_init(t_data->exec_site_map, EXEC_SITE_MAP_INIT, 0, 80, true) == 0);
   assert(mambo_set_thread_plugin_data(ctx, t_data) == MAMBO_SUCCESS);
 
   return 0;
@@ -1200,6 +1310,28 @@ int dependency_checker_post_thread(mambo_context *ctx) {
     mambo_free(ctx, t_data->chain_map);
   }
 
+  if (t_data->exec_site_map != NULL) {
+    for (size_t index = 0; index < t_data->exec_site_map->size; index++) {
+      uintptr_t value = 0;
+
+      if (t_data->exec_site_map->entries[index].key == 0) {
+        continue;
+      }
+
+      value = t_data->exec_site_map->entries[index].value;
+      if (value != 0) {
+        local_exec_counter_t *entry = (local_exec_counter_t *)value;
+        exec_site_entry_t *global_entry =
+            lookup_or_create_global_exec_site(ctx, entry->pc, entry->text);
+        atomic_increment_u64(&global_entry->count, entry->count);
+      }
+    }
+
+    free(t_data->exec_site_map->entries);
+    pthread_mutex_destroy(&t_data->exec_site_map->lock);
+    mambo_free(ctx, t_data->exec_site_map);
+  }
+
   mambo_free(ctx, t_data);
   return 0;
 }
@@ -1235,6 +1367,12 @@ int dependency_checker_pre_inst(mambo_context *ctx) {
                           &t_data->total_expensive_by_kind[curr_inst.expensive_kind],
                           1);
     }
+  }
+
+  if (should_track_site_execution(&curr_inst)) {
+    local_exec_counter_t *exec_counter =
+        lookup_or_create_local_exec_counter(ctx, t_data, &curr_inst);
+    emit_counter64_incr(ctx, &exec_counter->count, 1);
   }
 
   if (curr_inst.src_reg[0] >= 0 && curr_inst.src_reg[1] >= 0) {
@@ -1300,6 +1438,7 @@ __attribute__((constructor)) void dependency_checker_init(void) {
   int ret;
 
   assert(ctx != NULL);
+  assert(mambo_ht_init(&g_exec_site_map, GLOBAL_EXEC_SITE_MAP_INIT, 0, 80, true) == 0);
 
   fprintf(stderr, "[dep_chain] plugin loaded\n");
 
