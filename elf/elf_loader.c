@@ -197,6 +197,10 @@ void load_elf(char *filename, Elf **ret_elf, struct elf_loader_auxv *auxv, uintp
     assert(base_addr == (void*)min_addr);
   }
 
+  if (!is_interp) {
+    auxv->program_base = (uintptr_t)base_addr;
+  }
+
   /* entry address is the actual execution entry point, either in the interpreter
      (if one is used), or in the executable */
   *entry_addr = ehdr->e_entry;

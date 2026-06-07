@@ -64,6 +64,7 @@
 
 
 struct elf_loader_auxv {
+  uintptr_t program_base;
   uintptr_t at_base;
   uintptr_t at_entry;
   uintptr_t at_phdr;

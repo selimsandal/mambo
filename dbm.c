@@ -678,6 +678,7 @@ void main(int argc, char **argv, char **envp) {
   struct elf_loader_auxv auxv;
   uintptr_t entry_address;
   load_elf(argv[1], &elf, &auxv, &entry_address, false);
+  fprintf(stderr, "MAMBO: program base address: 0x%" PRIxPTR "\n", auxv.program_base);
   debug("entry address: 0x%" PRIxPTR "\n", entry_address);
 
   /*
